@@ -1,0 +1,633 @@
+#! /usr/bin/env nix-shell
+#! nix-shell -i python3 -p python3 python3Packages.requests python3Packages.beautifulsoup4 python3Packages.pypdf
+
+"""
+zotero_add - qutebrowser userscript + CLI for local PDFs
+
+Usage (qutebrowser):
+  Bind as userscript; qute will set QUTE_URL / QUTE_TITLE env vars.
+
+Usage (CLI):
+  ./zotero_add /path/to/file.pdf [optional: source_url]
+
+Credentials:
+  Provide Zotero API credentials via either environment variables:
+    ZOTERO_API_KEY, ZOTERO_LIBRARY_ID, ZOTERO_LIBRARY_TYPE  (library_type default "user")
+  or create ~/.config/zotero/credentials.json:
+    {"api_key":"...", "library_id":"1234567", "library_type":"user"}
+"""
+
+from __future__ import annotations
+import os, sys, re, json, time, tempfile, hashlib
+from urllib.parse import urljoin
+import requests
+from bs4 import BeautifulSoup
+from pypdf import PdfReader
+
+# -------------------- Config / credentials --------------------
+def load_credentials():
+    api_key = os.environ.get("ZOTERO_API_KEY")
+    lib_id = os.environ.get("ZOTERO_LIBRARY_ID")
+    lib_type = os.environ.get("ZOTERO_LIBRARY_TYPE", "user")
+    if api_key and lib_id:
+        return api_key, lib_id, lib_type
+    cred_path = os.path.expanduser(os.environ.get("ZOTERO_CREDENTIALS", "~/.config/zotero/credentials.json"))
+    try:
+        with open(cred_path, "r") as f:
+            c = json.load(f)
+            api_key = api_key or c.get("api_key")
+            lib_id = lib_id or str(c.get("library_id") or c.get("libraryId") or c.get("user_id"))
+            lib_type = lib_type or c.get("library_type", "user")
+    except FileNotFoundError:
+        pass
+    return api_key, lib_id, lib_type
+
+API_KEY, LIBRARY_ID, LIBRARY_TYPE = load_credentials()
+if not API_KEY or not LIBRARY_ID:
+    print("Missing Zotero credentials. Set env vars or create ~/.config/zotero/credentials.json", file=sys.stderr)
+    sys.exit(1)
+
+BASE = "https://api.zotero.org"
+HEADERS_JSON = {
+    "Zotero-API-Version": "3",
+    "Zotero-API-Key": API_KEY,
+    "Content-Type": "application/json"
+}
+
+# -------------------- Helpers --------------------
+def is_local_pdf_path(p: str) -> bool:
+    return os.path.isfile(p) and p.lower().endswith(".pdf")
+
+def get_env_url_title():
+    url = os.environ.get("QUTE_URL")
+    title = os.environ.get("QUTE_TITLE")
+    # allow CLI convenience: if first arg is a URL that isn't a local file, treat as page
+    if not url and len(sys.argv) > 1 and not is_local_pdf_path(sys.argv[1]):
+        url = sys.argv[1]
+        title = sys.argv[2] if len(sys.argv) > 2 else None
+    return url, title
+
+def http_get(url, timeout=15, stream=False):
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent":"qute-zotero/1.0"}, stream=stream)
+        r.raise_for_status()
+        return r
+    except Exception:
+        return None
+
+doi_re = re.compile(r"\b(10\.\d{4,9}/\S+)\b", re.IGNORECASE)
+
+def extract_doi_from_text(s: str | None):
+    if not s:
+        return None
+    m = doi_re.search(s)
+    if m:
+        return m.group(1).rstrip(").;,'\"")
+    return None
+
+def find_pdf_link_on_page(html: str, base_url: str):
+    soup = BeautifulSoup(html, "html.parser")
+    # meta tags first
+    meta_pdf = soup.find("meta", {"name": "citation_pdf_url"}) or soup.find("meta", {"name":"pdf_url"})
+    if meta_pdf and meta_pdf.get("content"):
+        return urljoin(base_url, meta_pdf["content"].strip())
+    # anchors and iframes
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.lower().endswith(".pdf"):
+            return urljoin(base_url, href)
+        if a.get("type") and "pdf" in a.get("type").lower():
+            return urljoin(base_url, href)
+    for f in soup.find_all(["iframe","embed"], src=True):
+        src = f["src"].strip()
+        if src.lower().endswith(".pdf") or "pdf" in src.lower():
+            return urljoin(base_url, src)
+    return None
+
+def download_to_tmp(url: str):
+    r = http_get(url, stream=True)
+    if not r:
+        return None
+    fd, path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    with open(path, "wb") as fh:
+        for chunk in r.iter_content(8192):
+            if chunk:
+                fh.write(chunk)
+    return path
+
+def extract_metadata_from_pdf(path: str):
+    meta = {"title": None, "authors": [], "doi": None}
+    try:
+        reader = PdfReader(path)
+        info = reader.metadata or {}
+        if getattr(info, "title", None):
+            meta["title"] = info.title
+        if getattr(info, "author", None):
+            authors = re.split(r';|, and | and |,', info.author)
+            meta["authors"] = [a.strip() for a in authors if a.strip()]
+        # look into first few pages for DOI & title heuristics
+        text = ""
+        for page in reader.pages[:3]:
+            try:
+                text += page.extract_text() or ""
+            except Exception:
+                pass
+        doi = extract_doi_from_text(text)
+        if doi:
+            meta["doi"] = doi
+        if not meta["title"]:
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            if lines:
+                meta["title"] = lines[0][:400]
+                if len(lines) > 1:
+                    maybe_authors = lines[1]
+                    if len(maybe_authors) < 200:
+                        meta["authors"] = [a.strip() for a in re.split(r';|, and | and |,', maybe_authors) if a.strip()]
+    except Exception:
+        pass
+    return meta
+
+def crossref_lookup(doi: str | None):
+    if not doi:
+        return None
+    url = f"https://api.crossref.org/works/{requests.utils.requote_uri(doi)}"
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent":"qute-zotero/1.0"})
+        if r.status_code != 200:
+            return None
+        return r.json().get("message", {})
+    except Exception:
+        return None
+
+def build_item_from_crossref(cr: dict):
+    item = {"itemType":"journalArticle", "title":"", "creators": []}
+    item["title"] = cr.get("title", [""])[0] if cr.get("title") else ""
+    for a in cr.get("author", []):
+        c = {"creatorType":"author"}
+        given = a.get("given","")
+        family = a.get("family","")
+        if family and given:
+            c["firstName"] = given
+            c["lastName"] = family
+        else:
+            c["lastName"] = a.get("name","")
+        item["creators"].append(c)
+    item["publicationTitle"] = cr.get("container-title", [""])[0] if cr.get("container-title") else ""
+    issued = cr.get("issued", {}).get("date-parts", [[None]])
+    if issued and issued[0] and issued[0][0]:
+        item["date"] = str(issued[0][0])
+    item["DOI"] = cr.get("DOI")
+    item["url"] = cr.get("URL")
+    return item
+
+def build_item_from_pdf_meta(pdf_meta: dict, source_url: str | None = None):
+    if pdf_meta.get("doi"):
+        cr = crossref_lookup(pdf_meta["doi"])
+        if cr:
+            return build_item_from_crossref(cr)
+    # fallback: webpage-like item
+    item = {"itemType":"webpage", "title": pdf_meta.get("title") or source_url or "Untitled", "url": source_url}
+    if pdf_meta.get("authors"):
+        item["creators"] = [{"creatorType":"author","lastName":a} for a in pdf_meta["authors"]]
+    return item
+
+# -------------------- Zotero REST helpers --------------------
+# --- helper: search items in your Zotero library by query (title or DOI) ---
+def search_items_in_library(query: str, limit: int = 10):
+    """Return list of items (JSON) matching query in your library using Zotero 'q' search."""
+    # search endpoint supports 'q' param for full-text search; format=json to get JSON
+    endpoint = f"{BASE}/{'users' if LIBRARY_TYPE=='user' else 'groups'}/{LIBRARY_ID}/items"
+    params = {"q": query, "limit": str(limit), "format": "json"}
+    headers = {"Zotero-API-Version": "3", "Zotero-API-Key": API_KEY}
+    r = requests.get(endpoint, headers=headers, params=params, timeout=20)
+    if r.status_code != 200:
+        print(f"[search] Zotero search failed: {r.status_code} {r.text}")
+        return []
+    try:
+        return r.json()
+    except Exception:
+        return []
+
+# --- robust create item that returns the Zotero item key ---
+def create_item_in_zotero(item: dict) -> str:
+    """
+    Create an item and return a usable Zotero item key.
+    Rejects obviously invalid keys (e.g. "0" or numeric-only keys) and falls back
+    to searching the library by DOI or title to locate the real key.
+    """
+    endpoint = f"{BASE}/{'users' if LIBRARY_TYPE=='user' else 'groups'}/{LIBRARY_ID}/items"
+    r = requests.post(endpoint, headers=HEADERS_JSON, data=json.dumps([item]), timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Create item failed: {r.status_code} {r.text}")
+
+    resp_text = r.text
+    try:
+        resp = r.json()
+    except Exception:
+        resp = None
+
+    def looks_like_valid_key(k: str) -> bool:
+        # Zotero item keys are alphanumeric; reject purely numeric keys like "0"
+        if not k or not isinstance(k, str):
+            return False
+        if k.isdigit():
+            return False
+        # length check (very permissive): keys are usually longer than 4 chars
+        if len(k) < 5:
+            return False
+        return True
+
+    # 1) Modern mapping {"successful": {"<key>": {...}}, "failed": {...}}
+    if isinstance(resp, dict) and "successful" in resp and isinstance(resp["successful"], dict):
+        skeys = list(resp["successful"].keys())
+        if skeys:
+            candidate = skeys[0]
+            if looks_like_valid_key(candidate):
+                print(f"[create] parsed key from 'successful': {candidate}")
+                return candidate
+            else:
+                print(f"[create] parsed candidate key from 'successful' looks invalid: {candidate!r}; will fallback to search")
+
+    # 2) List-of-created-objects forms
+    if isinstance(resp, list) and len(resp) > 0:
+        first = resp[0]
+        if isinstance(first, dict):
+            # common shapes: {"key":"ABC..."} or {"data":{"key":"ABC..."}}
+            k = first.get("key") or (first.get("data") or {}).get("key")
+            if k:
+                if looks_like_valid_key(k):
+                    print(f"[create] parsed key from list element: {k}")
+                    return k
+                else:
+                    print(f"[create] parsed key from list element looks invalid: {k!r}; will fallback to search")
+
+    # 3) Sometimes top-level keys are keys
+    if isinstance(resp, dict):
+        for k in resp.keys():
+            if k not in ("successful", "failed", "unchanged", "success"):
+                if looks_like_valid_key(k):
+                    print(f"[create] fallback: using top-level response key: {k}")
+                    return k
+                else:
+                    print(f"[create] found top-level key but it looks invalid: {k!r}")
+
+    # 4) Unable to extract a valid-looking key — print server response for diagnosis
+    print("[create] Could not parse a valid item key from create response. Server response below:")
+    print("[create] HTTP status:", r.status_code)
+    print("[create] Body:", resp_text)
+
+    # Fallback search by DOI (preferred)
+    doi = item.get("DOI")
+    if not doi and item.get("extra"):
+        m = re.search(r"DOI:(\S+)", item.get("extra", ""))
+        if m:
+            doi = m.group(1)
+    if doi:
+        print(f"[create] Trying library search by DOI: {doi}")
+        found = search_items_in_library(doi, limit=10)
+        for it in found:
+            data = it.get("data", it) if isinstance(it, dict) else it
+            cand_key = it.get("key") or data.get("key")
+            cand_doi = (data.get("DOI") or "").lower()
+            if cand_doi and doi.lower() in cand_doi:
+                if looks_like_valid_key(cand_key):
+                    print(f"[create] Found item by DOI with key: {cand_key}")
+                    return cand_key
+
+    # Fallback search by title
+    title = item.get("title")
+    if title:
+        print(f"[create] Searching by title for: {title[:200]}")
+        found = search_items_in_library(title, limit=10)
+        if found:
+            # try to find a close title match first
+            for it in found:
+                data = it.get("data", it) if isinstance(it, dict) else it
+                cand_key = it.get("key") or data.get("key")
+                cand_title = (data.get("title") or "").lower()
+                if cand_title and title.lower().split()[0] in cand_title:
+                    if looks_like_valid_key(cand_key):
+                        print(f"[create] Found candidate by title: {cand_key}")
+                        return cand_key
+            # last resort: take the first result if its key looks sane
+            first = found[0]
+            cand_key = first.get("key") or (first.get("data") or {}).get("key")
+            if looks_like_valid_key(cand_key):
+                print(f"[create] Returning first search result as last resort: {cand_key}")
+                return cand_key
+
+    raise RuntimeError("Unable to determine created item key from Zotero response and fallback search failed.")
+
+def create_attachment_item(parent_item_key: str, filename: str, content_type="application/pdf", title: str | None = None) -> str:
+    """
+    Create an attachment (imported_file) child item under parent_item_key and return the real Zotero item key.
+    Handles different response shapes returned by the Zotero API.
+    """
+    endpoint = f"{BASE}/{'users' if LIBRARY_TYPE=='user' else 'groups'}/{LIBRARY_ID}/items"
+    att = {
+        "itemType": "attachment",
+        "parentItem": parent_item_key,
+        "linkMode": "imported_file",
+        "title": title or filename,
+        "contentType": content_type,
+        "filename": filename,
+    }
+
+    r = requests.post(endpoint, headers=HEADERS_JSON, data=json.dumps([att]), timeout=30)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Create attachment failed: {r.status_code} {r.text}")
+
+    resp_text = r.text
+    try:
+        resp = r.json()
+    except Exception:
+        resp = None
+
+    # Utility to validate keys (same rules as for items)
+    def looks_like_valid_key(k: str) -> bool:
+        if not k or not isinstance(k, str):
+            return False
+        if k.isdigit():
+            return False
+        if len(k) < 5:
+            return False
+        return True
+
+    # 1) Newer responses may include "success": {"0": "WJK..."}
+    if isinstance(resp, dict) and "success" in resp and isinstance(resp["success"], dict):
+        vals = list(resp["success"].values())
+        if vals:
+            candidate = vals[0]
+            if looks_like_valid_key(candidate):
+                print(f"[attach-create] parsed attachment key from 'success': {candidate}")
+                return candidate
+            else:
+                print(f"[attach-create] 'success' value present but looks invalid: {candidate!r}")
+
+    # 2) Some responses include "successful": {"0": { "data": {"key": "WJK..."}, ... } }
+    if isinstance(resp, dict) and "successful" in resp and isinstance(resp["successful"], dict):
+        for idx, v in resp["successful"].items():
+            # v may contain .data.key
+            if isinstance(v, dict):
+                data = v.get("data") or {}
+                candidate = data.get("key")
+                if candidate and looks_like_valid_key(candidate):
+                    print(f"[attach-create] parsed attachment key from successful[{idx}].data.key: {candidate}")
+                    return candidate
+                # sometimes the inner object itself might include 'key' at top-level
+                if v.get("key") and looks_like_valid_key(v.get("key")):
+                    print(f"[attach-create] parsed attachment key from successful[{idx}].key: {v.get('key')}")
+                    return v.get("key")
+
+    # 3) If the response is a list-of-created-objects (older shape), check first element
+    if isinstance(resp, list) and len(resp) > 0:
+        first = resp[0]
+        if isinstance(first, dict):
+            k = first.get("key") or (first.get("data") or {}).get("key")
+            if k and looks_like_valid_key(k):
+                print(f"[attach-create] parsed key from list element: {k}")
+                return k
+            else:
+                print(f"[attach-create] list element key looked invalid or missing: {k!r}")
+
+    # 4) As a last resort, try to find an attachment child under the parent with the same filename
+    print("[attach-create] Could not parse attachment key from response. Server response:")
+    print("[attach-create] HTTP status:", r.status_code)
+    print("[attach-create] Body:", resp_text)
+
+    try:
+        query_endpoint = f"{BASE}/{'users' if LIBRARY_TYPE=='user' else 'groups'}/{LIBRARY_ID}/items"
+        params = {"parentItem": parent_item_key, "format": "json", "limit": "50"}
+        hdr = {"Zotero-API-Version": "3", "Zotero-API-Key": API_KEY}
+        q = requests.get(query_endpoint, headers=hdr, params=params, timeout=20)
+        if q.status_code == 200:
+            items = q.json()
+            for it in items:
+                data = it.get("data", it) if isinstance(it, dict) else it
+                if data.get("filename") and data.get("filename") == filename:
+                    cand_key = it.get("key") or data.get("key")
+                    if looks_like_valid_key(cand_key):
+                        print(f"[attach-create] Found existing attachment by filename, key: {cand_key}")
+                        return cand_key
+    except Exception as e:
+        print("[attach-create] search-by-parent failed:", e)
+
+    raise RuntimeError("Unable to determine created attachment key from Zotero response.")
+
+def compute_file_meta(path: str):
+    filesize = os.path.getsize(path)
+    mtime_ms = int(os.path.getmtime(path) * 1000)
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return filesize, mtime_ms, h.hexdigest()
+
+def upload_file_to_attachment(attachment_key: str, filepath: str):
+    """
+    Perform Zotero file upload flow robustly.
+    Handles variations in the upload-authorization response shapes (params as list or dict).
+    """
+    endpoint = f"{BASE}/{'users' if LIBRARY_TYPE=='user' else 'groups'}/{LIBRARY_ID}/items/{attachment_key}/file"
+    filesize, mtime_ms, md5_hex = compute_file_meta(filepath)
+    filename = os.path.basename(filepath)
+    auth_headers = {"If-None-Match": "*", "Zotero-API-Key": API_KEY, "Zotero-API-Version": "3"}
+    data = {"md5": md5_hex, "filename": filename, "filesize": str(filesize), "mtime": str(mtime_ms)}
+
+    # Step: ask for upload authorization, ask for params (params=1)
+    r = requests.post(endpoint, headers=auth_headers, data=data, params={"params": 1}, timeout=30)
+    try:
+        r.raise_for_status()
+    except Exception as e:
+        # show body for debugging
+        raise RuntimeError(f"Upload auth request failed: {r.status_code} {r.text}") from e
+
+    # tolerant parsing of response body
+    try:
+        resp = r.json()
+    except Exception:
+        # sometimes server returns a plain string or something odd; keep raw text for debugging
+        resp_text = r.text
+        raise RuntimeError(f"Upload auth response not JSON. Body: {resp_text}")
+
+    # If server claims file already exists
+    if isinstance(resp, dict) and resp.get("exists"):
+        upload_key = resp.get("uploadKey")
+        if upload_key:
+            reg = requests.post(endpoint, headers=auth_headers, data={"upload": upload_key}, timeout=30)
+            reg.raise_for_status()
+        print("File already exists on Zotero server; registered.")
+        return True
+
+    # Extract upload data robustly
+    upload_url = resp.get("url")
+    upload_key = resp.get("uploadKey")
+    params = resp.get("params")  # could be list OR dict OR None
+
+    if not upload_url or not upload_key:
+        # If there's prefix/suffix flow, these fields may be present instead
+        if resp.get("prefix") is not None or resp.get("suffix") is not None:
+            # prefix/suffix flow: concatenate
+            try:
+                with open(filepath, "rb") as fh:
+                    body = (resp.get("prefix", "").encode("utf-8") + fh.read() + resp.get("suffix", "").encode("utf-8"))
+                upload_r = requests.post(resp.get("url"), data=body, headers={"Content-Type": resp.get("contentType")}, timeout=120)
+                if upload_r.status_code not in (200, 201):
+                    raise RuntimeError(f"Upload failed (prefix/suffix): {upload_r.status_code} {upload_r.text}")
+            except Exception as e:
+                raise RuntimeError(f"Prefix/suffix upload failed: {e}") from e
+            # register
+            reg_r = requests.post(endpoint, headers=auth_headers, data={"upload": upload_key}, timeout=30)
+            if reg_r.status_code not in (200, 204):
+                raise RuntimeError(f"Register upload failed after prefix upload: {reg_r.status_code} {reg_r.text}")
+            print("Upload complete (prefix/suffix):", filename)
+            return True
+        # nothing useful found in response
+        raise RuntimeError("Upload authorization missing required fields (url/uploadKey) — server response: " + json.dumps(resp))
+
+    # Handle params shape: can be list of {name,value} OR dict name->value
+    form = None
+    if isinstance(params, dict):
+        # params provided as mapping name->value
+        form = params
+    elif isinstance(params, list):
+        try:
+            form = {p["name"]: p["value"] for p in params}
+        except Exception:
+            # fallback: maybe list of tuples or strange shapes — build defensively
+            form = {}
+            for p in params:
+                if isinstance(p, dict) and "name" in p and "value" in p:
+                    form[p["name"]] = p["value"]
+                elif isinstance(p, (list, tuple)) and len(p) >= 2:
+                    form[str(p[0])] = str(p[1])
+                else:
+                    # unexpected element shape — include raw repr so server body is visible in debug
+                    form[str(p)] = ""
+    elif params is None:
+        form = {}
+    else:
+        # unexpected type (e.g., string) — raise with debug info
+        raise RuntimeError(f"Unexpected 'params' type from server: {type(params)} - value: {params!r}")
+
+    # Do multipart/form-data upload if form fields present (or even if empty form)
+    try:
+        with open(filepath, "rb") as fh:
+            files = {"file": (filename, fh, "application/octet-stream")}
+            upload_r = requests.post(upload_url, data=form, files=files, timeout=120)
+        if upload_r.status_code not in (200, 201):
+            raise RuntimeError(f"Upload failed: {upload_r.status_code} {upload_r.text}")
+    except Exception as e:
+        raise RuntimeError(f"Upload POST failed: {e}") from e
+
+    # Register the upload
+    reg_r = requests.post(endpoint, headers=auth_headers, data={"upload": upload_key}, timeout=30)
+    if reg_r.status_code not in (200, 204):
+        raise RuntimeError(f"Register upload failed: {reg_r.status_code} {reg_r.text}")
+
+    print("Upload complete:", filename)
+    return True
+
+# -------------------- Main flow --------------------
+def main():
+    # Determine mode: local file or page
+    local_pdf = None
+    source_url = None
+    # CLI local file mode: first arg a path to local PDF
+    if len(sys.argv) > 1 and is_local_pdf_path(sys.argv[1]):
+        local_pdf = os.path.abspath(sys.argv[1])
+        if len(sys.argv) > 2:
+            source_url = sys.argv[2]
+    else:
+        # qutebrowser or URL mode
+        src_url, title = get_env_url_title()
+        if src_url and is_local_pdf_path(src_url):
+            local_pdf = os.path.abspath(src_url)
+        elif src_url:
+            source_url = src_url
+        # if QUTE_TITLE provided, it's available via title var but we use page scraping for metadata
+
+    pdf_path = None
+    pdf_meta = {}
+    doi = None
+
+    if local_pdf:
+        # local-file-first: extract metadata from local PDF
+        if not os.path.exists(local_pdf):
+            print("PDF not found:", local_pdf, file=sys.stderr)
+            return 1
+        pdf_path = local_pdf
+        pdf_meta = extract_metadata_from_pdf(pdf_path)
+        doi = pdf_meta.get("doi")
+    else:
+        # page mode: fetch page, try to locate PDF, then download
+        url, title = get_env_url_title()
+        if not url:
+            print("No URL or local file provided. Usage: ./zotero_add /path/to/file.pdf [source_url]", file=sys.stderr)
+            return 1
+        r = http_get(url)
+        if not r:
+            print("Failed to fetch page:", url, file=sys.stderr)
+            return 1
+        html = r.text
+        # look for DOI in meta first
+        soup = BeautifulSoup(html, "html.parser")
+        for n in ["citation_doi", "dc.identifier", "DC.identifier", "doi"]:
+            m = soup.find("meta", {"name": n}) or soup.find("meta", {"property": n})
+            if m and m.get("content"):
+                doi = m["content"].strip().replace("https://doi.org/","")
+                break
+        # try to find a linked PDF and download
+        pdf_url = find_pdf_link_on_page(html, url)
+        if pdf_url:
+            pdf_path = download_to_tmp(pdf_url)
+            if pdf_path:
+                pdf_meta = extract_metadata_from_pdf(pdf_path)
+                if not doi and pdf_meta.get("doi"):
+                    doi = pdf_meta.get("doi")
+
+    # Build item using DOI/CrossRef if possible
+    item = None
+    if doi:
+        cr = crossref_lookup(doi)
+        if cr:
+            item = build_item_from_crossref(cr)
+        else:
+            item = build_item_from_pdf_meta(pdf_meta, source_url)
+    else:
+        # fallback: use PDF meta or source url/title
+        title_guess = pdf_meta.get("title") or (source_url if source_url else "Untitled")
+        item = {"itemType":"webpage", "title": title_guess, "url": source_url}
+        if pdf_meta.get("authors"):
+            item["creators"] = [{"creatorType":"author","lastName":a} for a in pdf_meta["authors"]]
+
+    # Create item
+    try:
+        parent_key = create_item_in_zotero(item)
+        print("Created item:", parent_key)
+    except Exception as e:
+        print("Failed to create item:", e, file=sys.stderr)
+        return 1
+
+    # Attach PDF if available
+    if pdf_path:
+        try:
+            att_key = create_attachment_item(parent_key, os.path.basename(pdf_path), content_type="application/pdf", title=item.get("title"))
+            upload_file_to_attachment(att_key, pdf_path)
+            # if we downloaded a tmp file, remove it
+            # (local-file mode will not remove original)
+            if not local_pdf:
+                try:
+                    os.remove(pdf_path)
+                except Exception:
+                    pass
+        except Exception as e:
+            print("Attachment/upload failed:", e, file=sys.stderr)
+            return 1
+
+    print("Done.")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
