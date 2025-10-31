@@ -514,7 +514,7 @@ def upload_file_to_attachment(attachment_key: str, filepath: str):
     return True
 
 # -------------------- Main flow --------------------
-def main():
+def add_item():
     # Determine mode: local file or page
     local_pdf = None
     source_url = None
@@ -632,4 +632,4 @@ def main():
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(add_item())

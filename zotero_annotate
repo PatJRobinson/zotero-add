@@ -2,13 +2,13 @@
 #! nix-shell -i python3 -p python3 python3Packages.requests python3Packages.beautifulsoup4 python3Packages.pypdf
 
 """
-zotero_add - qutebrowser userscript + CLI for local PDFs
+zotero_annotate - qutebrowser userscript + CLI for local PDFs
 
 Usage (qutebrowser):
   Bind as userscript; qute will set QUTE_URL / QUTE_TITLE env vars.
 
 Usage (CLI):
-  ./zotero_annotate # gets all annotations from library items with a limit of 50
+  ./zotero_annotate /path/to/file.pdf [optional: source_url]
 
 Credentials:
   Provide Zotero API credentials via either environment variables:
@@ -18,9 +18,17 @@ Credentials:
 """
 import sys
 from pathlib import Path
-from lib.zotero_add import add_item
+from lib.zotero_annotate import ZoteroClient
 
 # Add the project root to sys.path dynamically
 sys.path.append(str(Path(__file__).resolve().parent))
 
-add_item()
+client = ZoteroClient()
+annotations = client.get_all_annotations(limit=50)
+
+for ann in annotations:
+    data = ann["data"]
+    print(f"[{data.get('pageLabel')}] {data.get('annotationText')}")
+    if comment := data.get("annotationComment"):
+        print(f"  Comment: {comment}")
+    print()
