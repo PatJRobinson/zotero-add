@@ -55,6 +55,7 @@ def write_markdown_for_item(item, annotations_by_attachment, output_dir: Path):
         annotations = entry["annotations"]
         att_title = attachment["data"].get("title", "Attachment")
 
+        ann_count = 0
         lines.append(f"## {att_title}")
         for ann in annotations:
 
@@ -64,7 +65,8 @@ def write_markdown_for_item(item, annotations_by_attachment, output_dir: Path):
             text = ann_data.get("annotationText", "")
             comment = ann_data.get("annotationComment", "")
             color = ann_data.get("annotationColor", "")
-            lines.append(f"\n")
+            lines.append("")
+            lines.append(f"### Annotation {ann_count}")
             lines.append(f"**p{page}, type: {ann_type}**")
             lines.append(f"{text}")
             if comment:
@@ -72,6 +74,7 @@ def write_markdown_for_item(item, annotations_by_attachment, output_dir: Path):
             if color:
                 lines.append(f"  > _(Color: {color})_")
             lines.append("")
+            ann_count = ann_count + 1
         lines.append("")
 
     filepath.write_text("\n".join(lines), encoding="utf-8")
