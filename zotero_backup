@@ -1,0 +1,26 @@
+#! /usr/bin/env nix-shell
+#! nix-shell -i python3 -p python3 python3Packages.requests python3Packages.beautifulsoup4 python3Packages.pypdf
+
+"""
+zotero_backup - qutebrowser userscript + CLI for local PDFs
+
+Usage (qutebrowser):
+  Bind as userscript; qute will set QUTE_URL / QUTE_TITLE env vars.
+
+Usage (CLI):
+  ./zotero_annotate # gets all annotations from library items with a limit of 50
+
+Credentials:
+  Provide Zotero API credentials via either environment variables:
+    ZOTERO_API_KEY, ZOTERO_LIBRARY_ID, ZOTERO_LIBRARY_TYPE  (library_type default "user")
+  or create ~/.config/zotero/credentials.json:
+    {"api_key":"...", "library_id":"1234567", "library_type":"user"}
+"""
+import sys
+from pathlib import Path
+from lib.zotero_backup import backup
+
+# backup the project root to sys.path dynamically
+sys.path.append(str(Path(__file__).resolve().parent))
+
+backup()
