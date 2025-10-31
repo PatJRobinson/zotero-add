@@ -152,6 +152,7 @@ def build_item_from_crossref(cr: dict):
             c["firstName"] = given
             c["lastName"] = family
         else:
+            c["firstName"] = ""
             c["lastName"] = a.get("name","")
         item["creators"].append(c)
     item["publicationTitle"] = cr.get("container-title", [""])[0] if cr.get("container-title") else ""
@@ -170,7 +171,7 @@ def build_item_from_pdf_meta(pdf_meta: dict, source_url: str | None = None):
     # fallback: webpage-like item
     item = {"itemType":"webpage", "title": pdf_meta.get("title") or source_url or "Untitled", "url": source_url}
     if pdf_meta.get("authors"):
-        item["creators"] = [{"creatorType":"author","lastName":a} for a in pdf_meta["authors"]]
+        item["creators"] = [{"creatorType":"author","lastName":a, "firstName":""} for a in pdf_meta["authors"]]
     return item
 
 # -------------------- Zotero REST helpers --------------------

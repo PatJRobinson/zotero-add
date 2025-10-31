@@ -68,7 +68,7 @@ def write_markdown_for_item(item, annotations_by_attachment, output_dir: Path):
             lines.append("")
             lines.append(f"### Annotation {ann_count}")
             lines.append(f"**p{page}, type: {ann_type}**")
-            lines.append(f"{text}")
+            lines.append(f"_\"{text}\"_")
             if comment:
                 lines.append(f"  > Comment: {comment}")
             if color:
