@@ -48,7 +48,8 @@ class ZoteroClient:
     def query_attachments(self, item_key: str) -> List[Dict]:
         """Return attachment items for a given library item."""
         url = f"{self.base_url}/items/{item_key}/children"
-        response = self.session.get(url)
+        params = {"limit": 100}
+        response = self.session.get(url, params=params)
         response.raise_for_status()
         return [
             i for i in response.json() if i["data"].get("itemType") == "attachment"
@@ -57,7 +58,8 @@ class ZoteroClient:
     def query_annotations(self, attachment_key: str) -> List[Dict]:
         """Return annotation items under a given attachment."""
         url = f"{self.base_url}/items/{attachment_key}/children"
-        response = self.session.get(url)
+        params = {"limit": 100}
+        response = self.session.get(url, params=params)
         response.raise_for_status()
         return [
             i for i in response.json() if i["data"].get("itemType") == "annotation"

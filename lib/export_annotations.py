@@ -54,6 +54,7 @@ def write_markdown_for_item(item, annotations_by_attachment, output_dir: Path):
         attachment = entry["attachment"]
         annotations = entry["annotations"]
         att_title = attachment["data"].get("title", "Attachment")
+        print(f"🔎 {att_title} → {len(annotations)} annotations")
 
         ann_count = 0
         lines.append(f"## {att_title}")
